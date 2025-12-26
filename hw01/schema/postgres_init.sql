@@ -64,6 +64,10 @@ COMMENT ON TABLE users IS 'Пользователи бонусной систе�
 COMMENT ON COLUMN users.phone IS 'Номер телефона пользователя (10 цифр, без кода страны)';
 COMMENT ON COLUMN users.current_balance IS 'Текущий баланс баллов (кэш), подтверждается журналом транзакций';
 
+-- Индекс для выборок по региону (например, для массовых рассылок бонусов по регионам)
+CREATE INDEX idx_users_region_id 
+ON rewards.users (region_id);
+
 -- ----------------------------
 -- Таблица: user_profiles
 -- ----------------------------
@@ -71,6 +75,12 @@ CREATE TABLE user_profiles (
   user_id      BIGINT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
   display_name VARCHAR(100),
   birth_date   DATE,
+  CONSTRAINT chk_birth_date_valid 
+    CHECK (
+      -- Допустимые даты рождения: с 1900-01-02 по текущую дату
+      birth_date > '1900-01-01'
+      -- другие ограничения по дате рождения добавляются на уровне приложения
+    ),
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -78,6 +88,10 @@ CREATE TABLE user_profiles (
 COMMENT ON TABLE user_profiles IS 'Профиль пользователя';
 COMMENT ON COLUMN user_profiles.display_name IS 'Ник для отображения в UI';
 COMMENT ON COLUMN user_profiles.birth_date IS 'Дата рождения (используется для начисления birthday_bonus)';
+
+-- Индекс для выборок по дню и месяцу рождения (для массового начисления birthday_bonus)
+CREATE INDEX idx_profiles_birthday_month_day 
+ON rewards.user_profiles (extract(month from birth_date), extract(day from birth_date));
 
 -- ----------------------------
 -- Таблица: tasks
@@ -110,6 +124,13 @@ CREATE TABLE task_availability (
 COMMENT ON TABLE task_availability IS 'Дополнительная таблица для сезонных/промо заданий';
 COMMENT ON COLUMN task_availability.reason IS 'Причина/тип окна доступности задания';
 
+-- Композитный индекс для поиска активных промо-заданий на текущую дату
+CREATE INDEX idx_task_availability_dates 
+ON rewards.task_availability (task_id, valid_from, valid_to);
+
+COMMENT ON INDEX rewards.idx_task_availability_dates IS 
+'Используется для выборки: какие промо-задания доступны сегодня?';
+
 
 -- ----------------------------
 -- Таблица: daily_tasks
@@ -128,6 +149,13 @@ CREATE TABLE daily_tasks (
 COMMENT ON TABLE daily_tasks IS 'Ежедневные задания, доступные для выполнения пользователями.';
 COMMENT ON COLUMN daily_tasks.task_date IS 'Дата, на которую назначено задание.';
 
+-- Индекс для быстрого получения всех заданий на конкретную дату
+CREATE INDEX idx_daily_tasks_date 
+ON rewards.daily_tasks (task_date);
+
+COMMENT ON INDEX rewards.idx_daily_tasks_date IS 
+'Индекс для выборки заданий на конкретную дату';
+
 
 -- ----------------------------
 -- Таблица: user_tasks
@@ -142,6 +170,20 @@ CREATE TABLE user_tasks (
 );
 
 COMMENT ON TABLE user_tasks IS 'Выполненные задания пользователям';
+
+-- Индекс для выборки всех пользователей, выполнивших конкретное задание
+CREATE INDEX idx_user_tasks_daily_task 
+ON rewards.user_tasks (daily_task_id, completed_at);
+
+COMMENT ON INDEX rewards.idx_user_tasks_daily_task IS 
+'Используется для аналитики: сколько пользователей выполнили задание X?';
+
+-- Композитный индекс для истории выполненных заданий пользователя
+CREATE INDEX idx_user_tasks_user_completed 
+ON rewards.user_tasks (user_id, completed_at DESC);
+
+COMMENT ON INDEX rewards.idx_user_tasks_user_completed IS 
+'Для отображения истории выполненных заданий в профиле пользователя';
 
 -- ----------------------------
 -- Таблица: products
@@ -164,7 +206,11 @@ COMMENT ON COLUMN products.duration_days IS 'Длительность дейст
 CREATE TABLE prices (
   price_id    SERIAL PRIMARY KEY,
   product_id  INT NOT NULL REFERENCES products(product_id) ON DELETE CASCADE,
-  amount      INT NOT NULL CHECK (amount > 0),
+  amount      INT NOT NULL
+  CONSTRAINT chk_amount_non_zero CHECK (
+    amount > 0 AND -- цена должна быть положительной
+    amount <= 1000000 -- ограничение сверху для защиты от ошибок
+  ),
 
   valid_from  DATE NOT NULL,
   valid_to    DATE, -- NULL означает "действует бессрочно"
@@ -200,6 +246,35 @@ COMMENT ON TABLE purchases IS 'Факт покупки/активации про
 COMMENT ON COLUMN purchases.price_amount IS 'Снимок цены на момент покупки (не меняется при обновлении prices).';
 COMMENT ON COLUMN purchases.expires_at IS 'Срок действия активированного продукта (если применимо).';
 
+-- Бизнес-ограничение: срок истечения должен быть позже даты покупки
+ALTER TABLE purchases ADD CONSTRAINT chk_expires_after_purchase 
+  CHECK (expires_at IS NULL OR expires_at > purchased_at);
+
+COMMENT ON CONSTRAINT chk_expires_after_purchase ON purchases IS 
+'Срок истечения не может быть раньше даты покупки';
+
+-- Частичный индекс для ускорения выборок активных покупок, которые скоро истекают
+CREATE INDEX idx_purchases_active_expires 
+ON rewards.purchases (expires_at) 
+WHERE status = 'active';
+
+COMMENT ON INDEX rewards.idx_purchases_active_expires IS 
+'Частичный индекс для поиска истекающих подписок (только активные)';
+
+-- Индекс для выборок по продукту (например, для отчетов: Сколько пользователей приобрели продукт X?)
+CREATE INDEX idx_purchases_product_id 
+ON rewards.purchases (product_id);
+
+COMMENT ON INDEX rewards.idx_purchases_product_id IS 
+'Для аналитики популярности продуктов и подсчета количества покупок';
+
+-- Композитный индекс для истории покупок пользователя
+CREATE INDEX idx_purchases_user_purchased 
+ON rewards.purchases (user_id, purchased_at DESC);
+
+COMMENT ON INDEX rewards.idx_purchases_user_purchased IS 
+'Для отображения истории покупок в профиле пользователя';
+
 -- ----------------------------
 -- Таблица: point_transactions (журнал баллов)
 -- ----------------------------
@@ -207,7 +282,9 @@ CREATE TABLE point_transactions (
   tx_id         BIGSERIAL PRIMARY KEY,
   user_id       BIGINT NOT NULL REFERENCES users(user_id),
 
-  amount        INT NOT NULL,          
+  amount        INT NOT NULL,
+  CONSTRAINT chk_amount_non_zero CHECK (amount <> 0), 
+
   balance_after INT NOT NULL,          
 
   type          points_tx_type NOT NULL, -- 'task_reward', 'purchase' и т.д.
@@ -228,3 +305,24 @@ COMMENT ON COLUMN point_transactions.external_id IS 'Идемпотентный 
 COMMENT ON COLUMN point_transactions.balance_after IS 'Баланс пользователя после операции (денормализация для аудита)';
 COMMENT ON COLUMN point_transactions.user_task_id IS 'Ссылка на выполненное задание (для type = task_reward)';
 COMMENT ON COLUMN point_transactions.purchase_id IS 'Ссылка на покупку (для type = purchase)';
+
+-- Ожидается самый частый запрос от мобильного приложения: «Покажи мои последние 20 транзакций».
+CREATE INDEX idx_tx_user_created 
+ON rewards.point_transactions (user_id, created_at DESC);
+
+COMMENT ON INDEX rewards.idx_tx_user_created IS 
+'Основной индекс для получения истории транзакций пользователя с сортировкой по дате';
+
+-- Индекс для выборок по типу транзакции и времени (для отчетов: Сколько бонусов типа welcome_bonus мы выдали за последнюю неделю?).
+CREATE INDEX idx_tx_type_created 
+ON rewards.point_transactions (type, created_at);
+
+COMMENT ON INDEX rewards.idx_tx_type_created IS 
+'Для аналитических отчетов по типам операций за период';
+
+-- Бизнес-ограничение: баланс после операции должен быть неотрицательным
+ALTER TABLE point_transactions ADD CONSTRAINT chk_balance_after_non_negative 
+  CHECK (balance_after >= 0);
+
+COMMENT ON CONSTRAINT chk_balance_after_non_negative ON point_transactions IS 
+'Баланс пользователя после операции не может быть отрицательным';
